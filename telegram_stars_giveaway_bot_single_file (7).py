@@ -1,102 +1,41 @@
+# ================================
+# Ferrari Giveaway Bot | aiogram 3.7+
+# Single file for BotHost.ru
+# ================================
+
 import asyncio
+import logging
 import random
 import sqlite3
+import os
+
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardMarkup,
-    InlineKeyboardButton,
+    InlineKeyboardButton
 )
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# =====================================
-# НАСТРОЙКИ ENV
-# =====================================
-# BotHost.ru -> Переменные окружения
-# TOKEN = токен бота
-# ADMIN_ID = ваш Telegram ID
-# CHANNEL_ID = ID канала
-# CHANNEL_USERNAME = username канала без @
+from dotenv import load_dotenv
 
-import os
+# ================================
+# LOAD ENV
+# ================================
+
+load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "https://t.me/test")ueError("TOKEN не найден в переменных окружения")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")
 
-# =====================================
-# БАЗА ДАННЫХ
-# =====================================
-conn = sqlite3.connect("ferrari_giveaway.db")
-cursor = conn.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    username TEXT,
-    balance INTEGER DEFAULT 0,
-    ref_balance INTEGER DEFAULT 0,
-    invited_by INTEGER DEFAULT 0,
-    referrals INTEGER DEFAULT 0
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS giveaways (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    stars INTEGER,
-    participants TEXT,
-    active INTEGER DEFAULT 1,
-    winner_id INTEGER DEFAULT 0
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS withdraws (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    amount INTEGER,
-    status TEXT DEFAULT 'pending'
-)
-""")
-
-conn.commit()
-
-# SETTINGS TABLE
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-)
-''')
-conn.commit()
-
-settings_defaults = {
-    'ref_reward': '5',
-    'refs_enabled': 'on',
-    'required_channel': CHANNEL_USERNAME,
-    'sponsor_channel': ''
-}
-
-for k, v in settings_defaults.items():
-    cursor.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-        (k, v)
-    )
-
-conn.commit()
-
-# =====================================
-# БОТ
-# =====================================
 bot = Bot(
     token=TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -104,868 +43,822 @@ bot = Bot(
 
 dp = Dispatcher(storage=MemoryStorage())
 
-# =====================================
-# СОСТОЯНИЯ
-# =====================================
-class GiveawayCreate(StatesGroup):
-    waiting_stars = State()
-    waiting_confirm = State()
+logging.basicConfig(level=logging.INFO)
 
+# ================================
+# DATABASE
+# ================================
 
-class WithdrawState(StatesGroup):
-    waiting_amount = State()
+db = sqlite3.connect("database.db")
+sql = db.cursor()
 
+sql.execute("""
+CREATE TABLE IF NOT EXISTS users(
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    balance INTEGER DEFAULT 0,
+    ref_balance INTEGER DEFAULT 0,
+    invited_by INTEGER,
+    invited INTEGER DEFAULT 0
+)
+""")
 
-class AddBalanceState(StatesGroup):
-    waiting_user = State()
-    waiting_amount = State()
+sql.execute("""
+CREATE TABLE IF NOT EXISTS settings(
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
 
-# =====================================
-# ПРОВЕРКА ПОДПИСКИ
-# =====================================
-async def check_sub(user_id):
+sql.execute("""
+CREATE TABLE IF NOT EXISTS giveaways(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prize INTEGER,
+    sponsor TEXT,
+    active INTEGER DEFAULT 1,
+    winner INTEGER
+)
+""")
+
+sql.execute("""
+CREATE TABLE IF NOT EXISTS participants(
+    giveaway_id INTEGER,
+    user_id INTEGER
+)
+""")
+
+sql.execute("""
+CREATE TABLE IF NOT EXISTS withdraws(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    amount INTEGER,
+    type TEXT,
+    status TEXT DEFAULT 'pending'
+)
+""")
+
+db.commit()
+
+# ================================
+# SETTINGS
+# ================================
+
+def get_setting(key, default=None):
+    sql.execute("SELECT value FROM settings WHERE key=?", (key,))
+    data = sql.fetchone()
+    return data[0] if data else default
+
+def set_setting(key, value):
+    sql.execute("""
+    INSERT OR REPLACE INTO settings(key, value)
+    VALUES(?, ?)
+    """, (key, str(value)))
+    db.commit()
+
+if get_setting("ref_enabled") is None:
+    set_setting("ref_enabled", "1")
+
+if get_setting("ref_reward") is None:
+    set_setting("ref_reward", "10")
+
+# ================================
+# FSM
+# ================================
+
+class GiveawayState(StatesGroup):
+    waiting_prize = State()
+    waiting_sponsor = State()
+    confirm = State()
+
+class BroadcastState(StatesGroup):
+    waiting_text = State()
+
+class SponsorState(StatesGroup):
+    waiting_channel = State()
+
+class RefRewardState(StatesGroup):
+    waiting_reward = State()
+
+# ================================
+# KEYBOARDS
+# ================================
+
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👤 Профиль", callback_data="profile")
+        ],
+        [
+            InlineKeyboardButton(text="💸 Вывод", callback_data="withdraw"),
+            InlineKeyboardButton(text="🎁 Вывод реф", callback_data="withdraw_ref")
+        ]
+    ])
+
+def admin_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎉 Создать розыгрыш", callback_data="create_giveaway")
+        ],
+        [
+            InlineKeyboardButton(text="📢 Рассылка", callback_data="broadcast")
+        ],
+        [
+            InlineKeyboardButton(text="🎁 Реф система", callback_data="ref_system")
+        ],
+        [
+            InlineKeyboardButton(text="🤝 Спонсор", callback_data="sponsor")
+        ]
+    ])
+
+# ================================
+# UTILS
+# ================================
+
+def register_user(user_id, username, ref=None):
+    sql.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    user = sql.fetchone()
+
+    if not user:
+        sql.execute("""
+        INSERT INTO users(user_id, username, invited_by)
+        VALUES(?, ?, ?)
+        """, (user_id, username, ref))
+        db.commit()
+
+        if ref and ref != user_id and get_setting("ref_enabled") == "1":
+            reward = int(get_setting("ref_reward", 10))
+
+            sql.execute("""
+            UPDATE users
+            SET ref_balance = ref_balance + ?,
+                invited = invited + 1
+            WHERE user_id=?
+            """, (reward, ref))
+
+            db.commit()
+
+def get_user(user_id):
+    sql.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    return sql.fetchone()
+
+async def check_sub(user_id, channel):
     try:
-        member = await bot.get_chat_member(CHANNEL_ID, user_id)
-
-        sponsor = get_setting('sponsor_channel')
-
-        if sponsor:
-            sponsor_name = sponsor.replace('https://t.me/', '').replace('@', '')
-
-            sponsor_member = await bot.geawait bot.get_chat_member(f"@{sponsor_name}", user_id)status in ["member", "administrator", "creator"]
-        else:
-            sponsor_ok = True
-
-        return member.status in ["member", "administrator", "creator"] and sponsor_ok
+        member = await bot.get_chat_member(channel, user_id)
+        return member.status in [
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.CREATOR
+        ]
     except:
         return False
 
-
-# =====================================
-# ФУНКЦИИ
-# =====================================
-def get_user(user_id):
-    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    return cursor.fetchone()
-
-
-def create_user(user_id, username):
-    if not get_user(user_id):
-        cursor.execute(
-            "INSERT INTO users (user_id, username) VALUES (?, ?)",
-            (user_id, username)
-        )
-        conn.commit()
-
-
-def get_balance(user_id):
-    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    return result[0] if result else 0
-
-
-def get_setting(key):
-    cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
-    result = cursor.fetchone()
-    return result[0] if result else None
-
-
-def set_setting(key, value):
-    cursor.execute(
-        "UPDATE settings SET value=? WHERE key=?",
-        (value, key)
-    )
-    conn.commit()
-
-
-def add_ref_balance(user_id, amount):
-    cursor.execute(
-        "UPDATE users SET ref_balance = ref_balance + ? WHERE user_id = ?",
-        (amount, user_id)
-    )
-    conn.commit()
-
-
-def add_balance(user_id, amount):
-    cursor.execute(
-        "UPDATE users SET balance = balance + ? WHERE user_id = ?",
-        (amount, user_id)
-    )
-    conn.commit()
-
-
-def remove_balance(user_id, amount):
-    cursor.execute(
-        "UPDATE users SET balance = balance - ? WHERE user_id = ?",
-        (amount, user_id)
-    )
-    conn.commit()
-
-
-# =====================================
-# КНОПКИ
-# =====================================
-def main_menu():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="👤 Профиль", callback_data="profile")
-    return kb.as_markup()
-
-
-def profile_menu():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="💸 Вывод", callback_data="withdraw")
-    return kb.as_markup()
-
-
-def admin_menu():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🎁 Создать розыгрыш", callback_data="create_giveaway")
-    kb.button(text="⭐ Начислить звезды", callback_data="add_stars")
-    kb.button(text="👥 Реф система", callback_data="ref_settings")
-    kb.button(text="📢 Рассылка", callback_data="mailing")
-    kb.button(text="📣 Спонсоры", callback_data="sponsors")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-# =====================================
+# ================================
 # START
-# =====================================
-@dp.message(Command("start"))
+# ================================
+
+@dp.message(CommandStart())
 async def start(message: Message):
+
     args = message.text.split()
 
-    ref_id = 0
+    ref = None
 
-    if len(args) > 1 and args[1].startswith("ref_"):
-        ref_id = int(args[1].split("_")[1])
+    if len(args) > 1:
+        data = args[1]
 
-    create_user(message.from_user.id, message.from_user.username)
-
-    if ref_id and ref_id != message.from_user.id:
-        cursor.execute(
-            "SELECT invited_by FROM users WHERE user_id=?",
-            (message.from_user.id,)
-        )
-
-        invited = cursor.fetchone()
-
-        if invited and invited[0] == 0:
-            cursor.execute(
-                "UPDATE users SET invited_by=? WHERE user_id=?",
-                (ref_id, message.from_user.id)
-            )
-
-            cursor.execute(
-                "UPDATE users SET referrals = referrals + 1 WHERE user_id=?",
-                (ref_id,)
-            )
-
-            if get_setting('refs_enabled') == 'on':
-                reward = int(get_setting('ref_reward'))
-                add_ref_balance(ref_id, reward)
-            conn.commit()
-
+        if data.startswith("ref_"):
             try:
-                await bot.send_message(
-                    ref_id,
-                    "🎉 Новый реферал!
-⭐ Вам начислено 5 звезд"
-                )
+                ref = int(data.split("_")[1])
             except:
                 pass
 
-    args = message.text.split()
+        if data.startswith("join_"):
+            giveaway_id = int(data.split("_")[1])
 
-    # DEEP LINK JOIN
-    if len(args) > 1 and args[1].startswith("join_"):
-        giveaway_id = int(args[1].split("_")[1])
+            await join_giveaway(message, giveaway_id)
+            return
 
-        cursor.execute(
-            "SELECT participants, active FROM giveaways WHERE id=?",
-            (giveaway_id,)
-        )
-
-        data = cursor.fetchone()
-
-        if not data:
-            return await message.answer("❌ Розыгрыш не найден")
-
-        participants, active = data
-
-        if active == 0:
-            return await message.answer("❌ Розыгрыш завершен")
-
-        participants_list = participants.split(",") if participants else []
-
-        if str(message.from_user.id) in participants_list:
-            return await message.answer("❌ Вы уже участвуете")
-
-        emojis = ["🍎", "🚗", "⭐", "🐶"]
-        correct = random.choice(emojis)
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=e,
-                    callback_data=f"captcha_{giveaway_id}_{correct}_{e}"
-                ) for e in emojis
-            ]
-        ])
-
-        return await message.answer(
-            f"🤖 Пройдите капчу
-
-"
-            f"Нажмите на эмодзи: {correct}",
-            reply_markup=kb
-        )
-
-    text = (
-        "🏎 <b>Добро пожаловать в Ferrari Взлет!</b>
-
-"
-        "🎁 Участвуй в розыгрышах звезд
-"
-        "⭐ Получай награды
-"
-        "💸 Выводи призы подарком"
+    register_user(
+        message.from_user.id,
+        message.from_user.username,
+        ref
     )
 
-    if message.from_user.id == ADMIN_ID:
-        await message.answer(text, reply_markup=admin_menu())
-    else:
-        await message.answer(text, reply_markup=main_menu())
+    text = f"""
+<b>🏎 FERRARI STARS GIVEAWAY</b>
 
+Добро пожаловать, <b>{message.from_user.first_name}</b>!
 
-# =====================================
-# ПРОФИЛЬ
-# =====================================
+🔥 Лучшие Telegram Stars розыгрыши
+💎 Мгновенные выплаты
+🎁 Реферальная система
+⚡️ Ferrari-style дизайн
+
+Нажми кнопку ниже 👇
+"""
+
+    await message.answer(text, reply_markup=main_menu())
+
+# ================================
+# PROFILE
+# ================================
+
 @dp.callback_query(F.data == "profile")
-async def profile(callback: CallbackQuery):
-    balance = get_balance(callback.from_user.id)
+async def profile(call: CallbackQuery):
 
-    cursor.execute(
-        "SELECT referrals FROM users WHERE user_id=?",
-        (callback.from_user.id,)
+    user = get_user(call.from_user.id)
+
+    balance = user[2]
+    ref_balance = user[3]
+    invited = user[5]
+
+    me = await bot.get_me()
+
+    ref_link = f"https://t.me/{me.username}?start=ref_{call.from_user.id}"
+
+    text = f"""
+<b>👤 Ваш профиль</b>
+
+⭐ Баланс: <b>{balance}</b>
+🎁 Реф баланс: <b>{ref_balance}</b>
+
+👥 Приглашено: <b>{invited}</b>
+
+🔗 Реферальная ссылка:
+<code>{ref_link}</code>
+"""
+
+    await call.message.edit_text(
+        text,
+        reply_markup=main_menu()
     )
 
-    refs = cursor.fetchone()[0]
+# ================================
+# WITHDRAW
+# ================================
 
-    await callback.message.edit_text(
-        f"👤 <b>Ваш профиль</b>\n\n"
-        f"⭐ Баланс: <b>{balance}</b> звезд
-"
-        f"👥 Рефералов: <b>{refs}</b>",
-        reply_markup=profile_menu()
-    )
-
-
-# =====================================
-# ВЫВОД
-# =====================================
 @dp.callback_query(F.data == "withdraw")
-async def withdraw(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer(
-        "💸 Введите сумму вывода\n"
-        "<i>(приз будет выдан подарком)</i>"
-    )
-    await state.set_state(WithdrawState.waiting_amount)
+async def withdraw(call: CallbackQuery):
 
+    user = get_user(call.from_user.id)
 
-@dp.message(WithdrawState.waiting_amount)
-async def process_withdraw(message: Message, state: FSMContext):
-    try:
-        amount = int(message.text)
-    except:
-        return await message.answer("❌ Введите число")
+    if user[2] <= 0:
+        return await call.answer("Недостаточно звезд", show_alert=True)
 
-    balance = get_balance(message.from_user.id)
+    amount = user[2]
 
-    if amount > balance:
-        return await message.answer("❌ Недостаточно звезд")
+    sql.execute("""
+    INSERT INTO withdraws(user_id, amount, type)
+    VALUES(?, ?, ?)
+    """, (call.from_user.id, amount, "balance"))
 
-    remove_balance(message.from_user.id, amount)
+    sql.execute("""
+    UPDATE users
+    SET balance = 0
+    WHERE user_id=?
+    """, (call.from_user.id,))
 
-    cursor.execute(
-        "INSERT INTO withdraws (user_id, amount) VALUES (?, ?)",
-        (message.from_user.id, amount)
-    )
-    conn.commit()
-
-    withdraw_id = cursor.lastrowid
+    db.commit()
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
                 text="✅ Подтвердить",
-                callback_data=f"accept_withdraw_{withdraw_id}"
-            ),
+                callback_data=f"accept_{call.from_user.id}_{amount}"
+            )
+        ],
+        [
             InlineKeyboardButton(
                 text="❌ Отклонить",
-                callback_data=f"decline_withdraw_{withdraw_id}"
+                callback_data=f"decline_{call.from_user.id}_{amount}"
             )
         ]
     ])
 
-    username = message.from_user.username or message.from_user.first_name
-
     await bot.send_message(
         ADMIN_ID,
-        f"💸 <b>Новая заявка на вывод</b>\n\n"
-        f"👤 Пользователь: @{username}\n"
-        f"⭐ Сумма: {amount}",
+        f"""
+💸 Новая заявка
+
+👤 ID: <code>{call.from_user.id}</code>
+⭐ Сумма: <b>{amount}</b>
+""",
         reply_markup=kb
     )
 
-    await message.answer("✅ Заявка отправлена админу")
-    await state.clear()
+    await call.answer("Заявка отправлена")
 
+@dp.callback_query(F.data == "withdraw_ref")
+async def withdraw_ref(call: CallbackQuery):
 
-# =====================================
-# ОБРАБОТКА ВЫВОДА
-# =====================================
-@dp.callback_query(F.data.startswith("accept_withdraw_"))
-async def accept_withdraw(callback: CallbackQuery):
-    withdraw_id = int(callback.data.split("_")[-1])
+    user = get_user(call.from_user.id)
 
-    cursor.execute(
-        "UPDATE withdraws SET status='accepted' WHERE id=?",
-        (withdraw_id,)
-    )
-    conn.commit()
+    if user[3] < 100:
+        return await call.answer(
+            "Минимум 100 звезд",
+            show_alert=True
+        )
 
-    await callback.message.edit_text("✅ Вывод подтвержден")
+    amount = user[3]
 
+    sql.execute("""
+    INSERT INTO withdraws(user_id, amount, type)
+    VALUES(?, ?, ?)
+    """, (call.from_user.id, amount, "ref"))
 
-@dp.callback_query(F.data.startswith("decline_withdraw_"))
-async def decline_withdraw(callback: CallbackQuery):
-    withdraw_id = int(callback.data.split("_")[-1])
+    sql.execute("""
+    UPDATE users
+    SET ref_balance = 0
+    WHERE user_id=?
+    """, (call.from_user.id,))
 
-    cursor.execute(
-        "SELECT user_id, amount FROM withdraws WHERE id=?",
-        (withdraw_id,)
-    )
-
-    data = cursor.fetchone()
-
-    if data:
-        user_id, amount = data
-        add_balance(user_id, amount)
-
-    cursor.execute(
-        "UPDATE withdraws SET status='declined' WHERE id=?",
-        (withdraw_id,)
-    )
-    conn.commit()
-
-    await callback.message.edit_text("❌ Вывод отклонен, звезды возвращены")
-
-
-# =====================================
-# СОЗДАНИЕ РОЗЫГРЫША
-# =====================================
-@dp.callback_query(F.data == "create_giveaway")
-async def create_giveaway(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-
-    await callback.message.answer("⭐ Введите сумму выигрыша в звездах")
-    await state.set_state(GiveawayCreate.waiting_stars)
-
-
-@dp.message(GiveawayCreate.waiting_stars)
-async def giveaway_stars(message: Message, state: FSMContext):
-    try:
-        stars = int(message.text)
-    except:
-        return await message.answer("❌ Введите число")
-
-    await state.update_data(stars=stars)
+    db.commit()
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_giveaway"),
-            InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_giveaway")
+            InlineKeyboardButton(
+                text="✅ Подтвердить",
+                callback_data=f"accept_{call.from_user.id}_{amount}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌ Отклонить",
+                callback_data=f"decline_{call.from_user.id}_{amount}"
+            )
+        ]
+    ])
+
+    await bot.send_message(
+        ADMIN_ID,
+        f"""
+🎁 Реферальный вывод
+
+👤 ID: <code>{call.from_user.id}</code>
+⭐ Сумма: <b>{amount}</b>
+""",
+        reply_markup=kb
+    )
+
+    await call.answer("Заявка отправлена")
+
+# ================================
+# ADMIN
+# ================================
+
+@dp.message(Command("admin"))
+async def admin(message: Message):
+
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    await message.answer(
+        "<b>⚙️ Админ панель</b>",
+        reply_markup=admin_menu()
+    )
+
+# ================================
+# CREATE GIVEAWAY
+# ================================
+
+@dp.callback_query(F.data == "create_giveaway")
+async def create_giveaway(call: CallbackQuery, state: FSMContext):
+
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    await state.set_state(GiveawayState.waiting_prize)
+
+    await call.message.answer(
+        "Введите сумму выигрыша:"
+    )
+
+@dp.message(GiveawayState.waiting_prize)
+async def giveaway_prize(message: Message, state: FSMContext):
+
+    if not message.text.isdigit():
+        return await message.answer("Введите число")
+
+    await state.update_data(prize=int(message.text))
+
+    await state.set_state(GiveawayState.waiting_sponsor)
+
+    await message.answer(
+        "Введите sponsor channel username или -"
+    )
+
+@dp.message(GiveawayState.waiting_sponsor)
+async def giveaway_sponsor(message: Message, state: FSMContext):
+
+    sponsor = None if message.text == "-" else message.text
+
+    await state.update_data(sponsor=sponsor)
+
+    data = await state.get_data()
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✅ Создать",
+                callback_data="confirm_giveaway"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data="cancel_giveaway"
+            )
         ]
     ])
 
     await message.answer(
-        f"🎁 Создать розыгрыш на <b>{stars}</b> звезд?",
+        f"""
+🎉 Подтверждение
+
+⭐ Приз: {data['prize']}
+🤝 Спонсор: {sponsor}
+""",
         reply_markup=kb
     )
 
-
 @dp.callback_query(F.data == "cancel_giveaway")
-async def cancel_giveaway(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("❌ Создание отменено")
+async def cancel_giveaway(call: CallbackQuery, state: FSMContext):
 
+    await state.clear()
+
+    await call.message.answer("Отменено")
 
 @dp.callback_query(F.data == "confirm_giveaway")
-async def confirm_giveaway(callback: CallbackQuery, state: FSMContext):
+async def confirm_giveaway(call: CallbackQuery, state: FSMContext):
+
     data = await state.get_data()
-    stars = data["stars"]
 
-    cursor.execute(
-        "INSERT INTO giveaways (stars, participants) VALUES (?, ?)",
-        (stars, "")
-    )
-    conn.commit()
+    prize = data["prize"]
+    sponsor = data["sponsor"]
 
-    giveaway_id = cursor.lastrowid
+    sql.execute("""
+    INSERT INTO giveaways(prize, sponsor)
+    VALUES(?, ?)
+    """, (prize, sponsor))
+
+    giveaway_id = sql.lastrowid
+
+    db.commit()
+
+    me = await bot.get_me()
+
+    link = f"https://t.me/{me.username}?start=join_{giveaway_id}"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
                 text="🎉 Участвовать",
-                url=f"https://t.me/{(await bot.get_me()).username}?start=join_{giveaway_id}"
+                url=link
             )
         ]
     ])
 
     await bot.send_message(
         CHANNEL_ID,
-        f"🎁 <b>НОВЫЙ РОЗЫГРЫШ</b>\n\n"
-        f"⭐ Приз: <b>{stars}</b> звезд\n"
-        f"👥 Максимум участников: 12\n\n"
-        f"Нажми кнопку ниже чтобы участвовать!",
+        f"""
+🏎 <b>FERRARI GIVEAWAY</b>
+
+⭐ Приз: <b>{prize} Stars</b>
+
+👥 Участников: 0/12
+
+🔥 Успей принять участие!
+""",
         reply_markup=kb
     )
 
-    await callback.message.edit_text("✅ Розыгрыш создан")
     await state.clear()
 
+    await call.message.answer("Розыгрыш создан")
 
-# =====================================
-# УЧАСТИЕ
-# =====================================
-@dp.message(Command("start"))
-async def join_giveaway(message: Message):
-    args = message.text.split()
+# ================================
+# JOIN GIVEAWAY
+# ================================
 
-    if len(args) < 2 or not args[1].startswith("join_"):
-        return
+async def join_giveaway(message: Message, giveaway_id):
 
-    create_user(message.from_user.id, message.from_user.username)
+    sql.execute("""
+    SELECT * FROM giveaways
+    WHERE id=? AND active=1
+    """, (giveaway_id,))
 
-    giveaway_id = int(message.text.split("_")[1])
+    giveaway = sql.fetchone()
 
-    cursor.execute(
-        "SELECT participants, active FROM giveaways WHERE id=?",
-        (giveaway_id,)
+    if not giveaway:
+        return await message.answer("Розыгрыш завершен")
+
+    sponsor = giveaway[2]
+
+    sub_main = await check_sub(
+        message.from_user.id,
+        CHANNEL_ID
     )
 
-    data = cursor.fetchone()
-
-    if not data:
-        return await message.answer("❌ Розыгрыш не найден")
-
-    participants, active = data
-
-    if active == 0:
-        return await message.answer("❌ Розыгрыш завершен")
-
-    participants_list = participants.split(",") if participants else []
-
-    if str(message.from_user.id) in participants_list:
-        return await message.answer("❌ Вы уже участвуете")
-
-    # ПРОВЕРКА ПОДПИСКИ
-    sub = await check_sub(callback.from_user.id)
-
-    if not sub:
-        kb_sub = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📢 Подписаться",
-                    url=CHANNEL_USERNAME
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✅ Проверить",
-                    callback_data=f"recheck_{giveaway_id}"
-                )
-            ]
-        ])
-
-        return await callback.message.answer(
-            "❌ Для участия подпишитесь на канал",
-            reply_markup=kb_sub
+    if not sub_main:
+        return await message.answer(
+            f"Подпишитесь: https://t.me/{CHANNEL_USERNAME}"
         )
 
-    # РАНДОМ КАПЧА
-    emojis = ["🍎", "🚗", "⭐", "🐶"]
-    correct = random.choice(emojis)
+    if sponsor:
+        sub_sponsor = await check_sub(
+            message.from_user.id,
+            sponsor
+        )
+
+        if not sub_sponsor:
+            return await message.answer(
+                f"Подпишитесь на спонсора: https://t.me/{sponsor.replace('@','')}"
+            )
+
+    emoji = random.choice(["🔥", "🏎", "⭐", "💎"])
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text=e, callback_data=f"captcha_{giveaway_id}_{correct}_{e}")
-            for e in emojis
+            InlineKeyboardButton(
+                text=emoji,
+                callback_data=f"captcha_{giveaway_id}_{emoji}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌",
+                callback_data="wrong"
+            )
         ]
     ])
 
     await message.answer(
-        f"🤖 Пройдите капчу\n\n"
-        f"Нажмите на эмодзи: {correct}",
+        f"Выберите emoji {emoji}",
         reply_markup=kb
     )
 
-
 @dp.callback_query(F.data.startswith("captcha_"))
-async def captcha_check(callback: CallbackQuery):
-    parts = callback.data.split("_")
+async def captcha(call: CallbackQuery):
 
-    giveaway_id = int(parts[1])
-    correct = parts[2]
-    selected = parts[3]
+    data = call.data.split("_")
 
-    if correct != selected:
-        return await callback.answer("❌ Неверно", show_alert=True)
+    giveaway_id = int(data[1])
 
-    cursor.execute(
-        "SELECT participants, stars FROM giveaways WHERE id=?",
-        (giveaway_id,)
+    sql.execute("""
+    SELECT * FROM participants
+    WHERE giveaway_id=? AND user_id=?
+    """, (giveaway_id, call.from_user.id))
+
+    if sql.fetchone():
+        return await call.answer("Вы уже участвуете")
+
+    sql.execute("""
+    INSERT INTO participants(giveaway_id, user_id)
+    VALUES(?, ?)
+    """, (giveaway_id, call.from_user.id))
+
+    db.commit()
+
+    sql.execute("""
+    SELECT COUNT(*) FROM participants
+    WHERE giveaway_id=?
+    """, (giveaway_id,))
+
+    count = sql.fetchone()[0]
+
+    await call.message.edit_text(
+        f"✅ Вы участвуете!\n\n👥 {count}/12"
     )
 
-    participants, stars = cursor.fetchone()
+    if count >= 12:
 
-    participants_list = participants.split(",") if participants else []
+        sql.execute("""
+        SELECT user_id FROM participants
+        WHERE giveaway_id=?
+        """, (giveaway_id,))
 
-    if str(callback.from_user.id) in participants_list:
-        return await callback.answer("Вы уже участвуете")await callback.answer("❌ Вы уже участвуете", show_alert=True)     return await callback.answer("❌ Лимит участников"await callback.answer("❌ Лимит участников", show_alert=True)k.from_user.id))
+        users = sql.fetchall()
 
-    cursor.execute(
-        "UPDATE giveaways SET participants=? WHERE id=?",
-        (",".join(participants_list), giveaway_id)
-    )
-    conn.commit()
+        d1 = await bot.send_dice(CHANNEL_ID)
+        d2 = await bot.send_dice(CHANNEL_ID)
 
-    await callback.message.edit_text(
-        f"✅ Вы участвуете в розыгрыше!
-"
-        f"👥 Участников: {len(participants_list)}/12
+        total = d1.dice.value + d2.dice.value
 
-"
-        f"🎟 Ваш номер: <b>{len(participants_list)}</b>"
-    )
+        winner_index = (total - 1) % 12
 
-    # ОПРЕДЕЛЕНИЕ ПОБЕДИТЕЛЯ
-    if len(participants_list) >= 12:
-        dice1 = await bot.send_dice(CHANNEL_ID, emoji="🎲")
-        await asyncio.sleep(4)
+        winner_id = users[winner_index][0]
 
-        dice2 = await bot.send_dice(CHANNEL_ID, emoji="🎲")
-        await asyncio.sleep(4)
+        sql.execute("""
+        SELECT prize FROM giveaways
+        WHERE id=?
+        """, (giveaway_id,))
 
-        total = dice1.dice.value + dice2.dice.value
+        prize = sql.fetchone()[0]
 
-        winner_index = total - 1
+        sql.execute("""
+        UPDATE users
+        SET balance = balance + ?
+        WHERE user_id=?
+        """, (prize, winner_id))
 
-        if winner_index >= len(participants_list):
-            winner_index = random.randint(0, len(participants_list) - 1)
+        sql.execute("""
+        UPDATE giveaways
+        SET active=0,
+            winner=?
+        WHERE id=?
+        """, (winner_id, giveaway_id))
 
-        winner_id = int(participants_list[winner_index])
-
-        add_balance(winner_id, stars)
-
-        cursor.execute(
-            "UPDATE giveaways SET active=0, winner_id=? WHERE id=?",
-            (winner_id, giveaway_id)
-        )
-        conn.commit()
-
-        try:
-            user = await bot.get_chat(winner_id)
-            username = user.username
-            mention = f"@{username}" if username else user.first_name
-        except:
-            mention = str(winner_id)
+        db.commit()
 
         await bot.send_message(
             CHANNEL_ID,
-            f"🏆 <b>РОЗЫГРЫШ ЗАВЕРШЕН</b>\n\n"
-            f"🎲 Сумма кубиков: <b>{total}</b>\n"
-            f"👑 Победитель: {mention}\n"
-            f"⭐ Выигрыш: <b>{stars}</b> звезд"
+            f"""
+🏆 Победитель определен!
+
+👤 Победитель:
+<code>{winner_id}</code>
+
+⭐ Выигрыш:
+<b>{prize} Stars</b>
+"""
         )
 
         await bot.send_message(
             winner_id,
-            f"🎉 Поздравляем!\n\n"
-            f"Вы выиграли <b>{stars}</b> звезд!"
+            f"🎉 Вы выиграли {prize} Stars!"
         )
 
+# ================================
+# ACCEPT / DECLINE
+# ================================
 
-# =====================================
-# РЕФ ВЫВОД
-# =====================================
-@dp.callback_query(F.data == "withdraw_ref")
-async def withdraw_ref(callback: CallbackQuery):
-    cursor.execute(
-        "SELECT ref_balance FROM users WHERE user_id=?",
-        (callback.from_user.id,)
-    )
+@dp.callback_query(F.data.startswith("accept_"))
+async def accept(call: CallbackQuery):
 
-    ref_balance = cursor.fetchone()[0]
+    if call.from_user.id != ADMIN_ID:
+        return
 
-    if ref_balance < 100:
-        return await callback.answer(
-            "❌ Минимум 100 реф звезд",
-            show_alert=True
-        )
-
-    cursor.execute(
-        "UPDATE users SET ref_balance=0 WHERE user_id=?",
-        (callback.from_user.id,)
-    )
-    conn.commit()
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="✅ Подтвердить",
-                callback_data=f"accept_ref_{callback.from_user.id}_{ref_balance}"
-            ),
-            InlineKeyboardButton(
-                text="❌ Отклонить",
-                callback_data=f"decline_ref_{callback.from_user.id}_{ref_balance}"
-            )
-        ]
-    ])
+    user_id = int(call.data.split("_")[1])
+    amount = int(call.data.split("_")[2])
 
     await bot.send_message(
-        ADMIN_ID,
-        f"👥 Новый вывод реф баланса
-
-"
-        f"👤 ID: {callback.from_user.id}
-"
-        f"⭐ Сумма: {ref_balance}",
-        reply_markup=kb
+        user_id,
+        f"✅ Ваша заявка на {amount} Stars подтверждена"
     )
 
-    await callback.answer("✅ Заявка отправлена")
+    await call.message.edit_text("Подтверждено")
 
+@dp.callback_query(F.data.startswith("decline_"))
+async def decline(call: CallbackQuery):
 
-# =====================================
-# РЕФ НАСТРОЙКИ
-# =====================================
-@dp.callback_query(F.data == "ref_settings")
-async def ref_settings(callback: CallbackQuery):
-    status = get_setting('refs_enabled')
-    reward = get_setting('ref_reward')
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    user_id = int(call.data.split("_")[1])
+    amount = int(call.data.split("_")[2])
+
+    await bot.send_message(
+        user_id,
+        f"❌ Ваша заявка отклонена"
+    )
+
+    await call.message.edit_text("Отклонено")
+
+# ================================
+# REF SYSTEM
+# ================================
+
+@dp.callback_query(F.data == "ref_system")
+async def ref_system(call: CallbackQuery):
+
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    enabled = get_setting("ref_enabled")
+    reward = get_setting("ref_reward")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text="🔄 Вкл/Выкл",
-                callback_data="toggle_refs"
+                text="ON/OFF",
+                callback_data="toggle_ref"
             )
         ],
         [
             InlineKeyboardButton(
-                text="⭐ Изменить награду",
-                callback_data="change_ref_reward"
+                text="Изменить награду",
+                callback_data="change_reward"
             )
         ]
     ])
 
-    await callback.message.answer(
-        f"👥 Реф система
+    await call.message.answer(
+        f"""
+🎁 Реферальная система
 
-"
-        f"📊 Статус: {status}
-"
-        f"⭐ Награда: {reward}",
+Статус: {'ON' if enabled == '1' else 'OFF'}
+Награда: {reward}
+""",
         reply_markup=kb
     )
 
+@dp.callback_query(F.data == "toggle_ref")
+async def toggle_ref(call: CallbackQuery):
 
-@dp.callback_query(F.data == "toggle_refs")
-async def toggle_refs(callback: CallbackQuery):
-    status = get_setting('refs_enabled')
+    current = get_setting("ref_enabled")
 
-    new_status = 'off' if status == 'on' else 'on'
-    set_setting('refs_enabled', new_status)
+    set_setting("ref_enabled", "0" if current == "1" else "1")
 
-    await callback.answer(f"Реф система: {new_await callback.answer(f"Реф система: {new_status}", show_alert=True)
-# СПОНСОРЫ
-# =====================================
-@dp.callback_query(F.data == "sponsors")
-async def sponsors(callback: CallbackQuery, state: FSMContext):
-    sponsor = get_setting('sponsor_channel')
+    await call.answer("Изменено")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="➕ Добавить/Изменить",
-                callback_data="add_sponsor"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="❌ Удалить",
-                callback_data="remove_sponsor"
-            )
-        ]
-    ])
+@dp.callback_query(F.data == "change_reward")
+async def change_reward(call: CallbackQuery, state: FSMContext):
 
-    await callback.message.answer(
-        f"📣 Текущий спонсор:
-{sponsor if sponsor else 'Нет'}",
-        reply_markup=kb
-    )
+    await state.set_state(RefRewardState.waiting_reward)
 
+    await call.message.answer("Введите новую награду")
 
-@dp.callback_query(F.data == "add_sponsor")
-async def add_sponsor(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer(
-        "📣 Отправьте username канала
+@dp.message(RefRewardState.waiting_reward)
+async def reward_input(message: Message, state: FSMContext):
 
-Пример: @ferrari_news"
-    )
+    if not message.text.isdigit():
+        return
 
-    await state.set_state(SponsorState.waiting_channel)
-
-
-@dp.message(SponsorState.waiting_channel)
-async def save_sponsor(message: Message, state: FSMContext):
-    channel = message.text.strip()
-
-    set_setting('sponsor_channel', channel)
-
-    await message.answer(
-        f"✅ Спонсор установлен:
-{channel}"
-    )
+    set_setting("ref_reward", message.text)
 
     await state.clear()
 
+    await message.answer("Изменено")
 
-@dp.callback_query(F.data == "remove_sponsor")
-async def remove_sponsor(callback: CallbackQuery):
-    set_setting('sponsor_channel', '')
+# ================================
+# SPONSOR
+# ================================
 
-    await callback.answer(
-        "❌ Спонсор удален",
-        show_alert=True
+@dp.callback_query(F.data == "sponsor")
+async def sponsor(call: CallbackQuery, state: FSMContext):
+
+    await state.set_state(SponsorState.waiting_channel)
+
+    await call.message.answer(
+        "Введите username канала (@channel)"
     )
 
+@dp.message(SponsorState.waiting_channel)
+async def sponsor_save(message: Message, state: FSMContext):
 
-# =====================================
-# РАССЫЛКА
-# =====================================
-class MailingState(StatesGroup):
-    waiting_text = State()
+    set_setting("global_sponsor", message.text)
 
+    await state.clear()
 
-class SponsorState(StatesGroup):
-    waiting_channel = State()
+    await message.answer("Спонсор сохранен")
 
+# ================================
+# BROADCAST
+# ================================
 
-@dp.callback_query(F.data == "mailing")
-async def mailing(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("📢 Введите текст рассылки")
-    await state.set_state(MailingState.waiting_text)
+@dp.callback_query(F.data == "broadcast")
+async def broadcast(call: CallbackQuery, state: FSMContext):
 
+    await state.set_state(BroadcastState.waiting_text)
 
-@dp.message(MailingState.waiting_text)
-async def process_mailing(message: Message, state: FSMContext):
-    cursor.execute("SELECT user_id FROM users")
-    users = cursor.fetchall()
+    await call.message.answer("Введите текст рассылки")
 
-    success = 0
+@dp.message(BroadcastState.waiting_text)
+async def broadcast_send(message: Message, state: FSMContext):
+
+    sql.execute("SELECT user_id FROM users")
+
+    users = sql.fetchall()
+
+    ok = 0
+    bad = 0
 
     for user in users:
         try:
             await bot.send_message(user[0], message.text)
-            success += 1
-            await asyncio.sleep(0.05)
+            ok += 1
         except:
-            pass
+            bad += 1
+
+    await state.clear()
 
     await message.answer(
-        f"✅ Рассылка завершена
-"
-        f"📨 Отправлено: {success}"
+        f"""
+📢 Рассылка завершена
+
+✅ Успешно: {ok}
+❌ Ошибок: {bad}
+"""
     )
 
-    await state.clear()
+# ================================
+# RUN
+# ================================
 
-
-# =====================================
-# НАЧИСЛЕНИЕ ЗВЕЗД
-# =====================================
-@dp.callback_query(F.data == "add_stars")
-async def add_stars(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-
-    await callback.message.answer(
-        "👤 Отправьте ID пользователя"
-    )
-
-    await state.set_state(AddBalanceState.waiting_user)
-
-
-@dp.message(AddBalanceState.waiting_user)
-async def add_balance_user(message: Message, state: FSMContext):
-    try:
-        user_id = int(message.text)
-    except:
-        return await message.answer("❌ Неверный ID")
-
-    await state.update_data(user_id=user_id)
-    await message.answer("⭐ Введите количество звезд")
-
-    await state.set_state(AddBalanceState.waiting_amount)
-
-
-@dp.message(AddBalanceState.waiting_amount)
-async def add_balance_amount(message: Message, state: FSMContext):
-    try:
-        amount = int(message.text)
-    except:
-        return await message.answer("❌ Введите число")
-
-    data = await state.get_data()
-    user_id = data["user_id"]
-
-    add_balance(user_id, amount)
-
-    await message.answer("✅ Звезды начислены")
-
-    try:
-        await bot.send_message(
-            user_id,
-            f"⭐ Вам начислено {amount} звезд"
-        )
-    except:
-        pass
-
-    await state.clear()
-
-
-# =====================================
-# ЗАПУСК
-# =====================================
 async def main():
-    print("Bot started...")
-    await dp.start_polling(bot)
+    print("BOT STARTED")
 
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-# =====================================
-# requirements.txt
-# =====================================
-# Создай рядом файл requirements.txt
-# и вставь туда:
-#
-# aiogram==3.7.0
-# aiogram==3.7.0
-# aiosqlite==0.20.0
